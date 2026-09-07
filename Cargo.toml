@@ -1,0 +1,20 @@
+[package]
+name = "qomicex-updater"
+version = "0.1.0"
+edition = "2021"
+description = "Qomicex Launcher self-updater: verify, install and relaunch"
+license = "GPL-3.0"
+
+[[bin]]
+name = "qomicex-updater"
+path = "src/main.rs"
+
+[dependencies]
+minisign-verify = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
