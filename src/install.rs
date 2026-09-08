@@ -203,9 +203,17 @@ pub fn install_system(package: &Path) -> Result<(), String> {
 fn elevate_copy(src: &Path, dst: &Path, cleanup_dst: bool) -> Result<(), String> {
     let script =
         std::env::temp_dir().join(format!("qomicex-update-elevate-{}.sh", std::process::id()));
-    let mut body = format!("cp -a '{src}'/. '{dst}'/ && rm -rf '{src}'");
+    let mut body = format!(
+        "cp -a '{s}'/. '{d}'/ && rm -rf '{s}'",
+        s = src.display(),
+        d = dst.display()
+    );
     if cleanup_dst {
-        body = format!("cp -a '{src}'/. '{dst}'/ && rm -rf '{src}' '{dst}'/*.qdtmp");
+        body = format!(
+            "cp -a '{s}'/. '{d}'/ && rm -rf '{s}' '{d}'/*.qdtmp",
+            s = src.display(),
+            d = dst.display()
+        );
     }
     std::fs::write(&script, format!("#!/bin/sh\nset -e\n{body}\n")).map_err(|e| e.to_string())?;
     let status = Command::new("pkexec")
