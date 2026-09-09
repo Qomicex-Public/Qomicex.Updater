@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 minisign-verify = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"
