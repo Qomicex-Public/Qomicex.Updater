@@ -105,7 +105,14 @@ fn move_tree(src: &Path, dst: &Path) -> io::Result<()> {
             if target.exists() {
                 std::fs::remove_file(&target)?;
             }
-            std::fs::rename(entry.path(), &target)?;
+            if let Err(e) = std::fs::rename(entry.path(), &target) {
+                crate::ulog(&format!(
+                    "rename {} -> {} failed: {e}",
+                    entry.path().display(),
+                    target.display()
+                ));
+                return Err(e);
+            }
         }
     }
     Ok(())
