@@ -108,7 +108,12 @@ fn run() -> i32 {
     println!("signature ok");
 
     if let Some(pid) = args.wait_pid {
-        if let Err(e) = install::wait_process_exit(pid, std::time::Duration::from_secs(30)) {
+        // The launcher's teardown (backend kill, window close, async guards)
+        // has been observed taking >30s; the wait must cover it. Failure to
+        // observe an exit means the target is wedged — overwrite anyway
+        // (files may be locked; rename errors will surface in install) is
+        // worse than waiting, so keep retrying for 3 minutes.
+        if let Err(e) = install::wait_process_exit(pid, std::time::Duration::from_secs(180)) {
             eprintln!("{e}");
             return 5;
         }
@@ -132,6 +137,12 @@ fn run() -> i32 {
     println!("install ok");
 
     if let Some(exe) = &args.launch {
+        // Strip dev-harness env before relaunching: QOMICEX_LAUNCHER_MANAGED=1
+        // inherited from a debug launcher would stop the new (release) shell
+        // from spawning its embedded backend, and QOMICEX_UPDATER_PATH would
+        // override its embedded updater.
+        std::env::remove_var("QOMICEX_LAUNCHER_MANAGED");
+        std::env::remove_var("QOMICEX_UPDATER_PATH");
         if let Err(e) = install::launch(exe) {
             eprintln!("relaunch failed: {e}");
             return 2;
