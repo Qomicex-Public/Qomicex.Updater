@@ -31,7 +31,11 @@ static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 pub fn ulog(msg: &str) {
     use std::io::Write as _;
     if let Some(p) = LOG_PATH.get() {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -54,6 +58,7 @@ pub struct Args {
     pub app_bundle: Option<PathBuf>,
     pub wait_pid: Option<u32>,
     pub launch: Option<PathBuf>,
+    pub log: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -65,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
     let mut app_bundle = None;
     let mut wait_pid = None;
     let mut launch = None;
+    let mut log = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -87,6 +93,7 @@ fn parse_args() -> Result<Args, String> {
                 )
             }
             "--launch" => launch = Some(PathBuf::from(val("launch")?)),
+            "--log" => log = Some(PathBuf::from(val("log")?)),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -100,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
         app_bundle,
         wait_pid,
         launch,
+        log,
     })
 }
 
@@ -114,16 +122,17 @@ fn main() {
 fn run() -> i32 {
     let args = match parse_args() {
         Ok(a) => {
-            // Log file sits next to the signature (same temp dir the Tauri
-            // side writes the sig into); pid disambiguates concurrent runs.
-            let sig_parent = a
-                .signature
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(std::env::temp_dir);
-            let _ = LOG_PATH.set(
-                sig_parent.join(format!("qomicex-updater-{}.log", std::process::id())),
-            );
+            // Log path: explicit --log (launcher-side derived, preferred) or
+            // fallback next to the signature. pid disambiguates concurrent runs.
+            let log_path = a.log.clone().unwrap_or_else(|| {
+                let sig_parent = a
+                    .signature
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(std::env::temp_dir);
+                sig_parent.join(format!("qomicex-updater-{}.log", std::process::id()))
+            });
+            let _ = LOG_PATH.set(log_path);
             ulog(&format!(
                 "start pid={} package={} strategy={}",
                 std::process::id(),
