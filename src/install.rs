@@ -8,9 +8,16 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- waiting
+//
+// Cross-platform semantics: on Unix the running image is NOT write-locked —
+// an overwrite rename onto a running exe is legal (inode swap), so
+// probe_unlockable is always true there and the kill branch never fires.
+// Windows holds an exclusive image lock while the process runs, hence the
+// kill-on-locked path. The same install call therefore behaves correctly on
+// every platform without cfg divergence in the caller.
 
-/// Single probe: can we open the file for writing? (A running process keeps
-/// its image locked; exit releases it.)
+/// Single probe: can we open the file for writing? (Windows: a running
+/// process keeps its image locked; exit releases it. Unix: always true.)
 pub fn probe_unlockable(path: &Path) -> bool {
     std::fs::OpenOptions::new().write(true).open(path).is_ok()
 }
@@ -94,11 +101,14 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn process_alive(pid: u32) -> bool {
-    Command::new("ps")
-        .args(["-p", &pid.to_string()])
+    // kill -0 = pure existence probe (no signal delivered). Conservative on
+    // tool failure: report dead (false) so the caller's fallback wait can
+    // proceed instead of spinning forever.
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------- zip
