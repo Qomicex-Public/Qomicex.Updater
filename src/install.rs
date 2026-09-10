@@ -9,6 +9,69 @@ use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- waiting
 
+/// Single probe: can we open the file for writing? (A running process keeps
+/// its image locked; exit releases it.)
+pub fn probe_unlockable(path: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+/// Wait until the launcher exe is no longer locked (process exit releases
+/// the image lock). This is the real precondition for overwriting it, and
+/// unlike `tasklist`-style pid probing it has no localization issues
+/// (Chinese tasklist prints 「信息:」 not "INFO:", which broke the old check
+/// and made wait_* hang forever).
+pub fn wait_file_unlockable(path: &Path, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        if probe_unlockable(path) {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "file {} still locked after {timeout:?}",
+                path.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Force-kill the launcher process (image lock holder). Windows: `taskkill
+/// /F` on the single pid — deliberately **without /T**: the tree walk
+/// recurses into the shared WebView2 process pool and kills the updater
+/// itself (observed). Webview children don't lock the launcher exe.
+/// Unix: SIGKILL the process group (launcher was started with
+/// process_group(0)).
+pub fn kill_pid_tree(pid: u32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW（不闪控制台）
+            .status()
+            .map_err(|e| format!("cannot run taskkill: {e}"))?;
+        if !status.success() {
+            return Err(format!("taskkill exit {}", status.code().unwrap_or(-1)));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .status()
+            .map_err(|e| format!("cannot kill pgid: {e}"))?;
+        if !status.success() {
+            return Err(format!("kill exit {}", status.code().unwrap_or(-1)));
+        }
+        Ok(())
+    }
+}
+
+/// Legacy pid-based wait. Broken on non-English Windows (tasklist's
+/// "no tasks" line is localized) — kept only for callers without a file
+/// to probe; prefer [wait_file_unlockable].
 pub fn wait_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
     let start = Instant::now();
     while process_alive(pid) {

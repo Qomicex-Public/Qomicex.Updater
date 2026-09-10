@@ -153,18 +153,40 @@ fn run() -> i32 {
     }
     ulog("verify ok");
 
-    if let Some(pid) = args.wait_pid {
-        // The launcher's teardown (backend kill, window close, async guards)
-        // has been observed taking >30s; the wait must cover it. Failure to
-        // observe an exit means the target is wedged — overwrite anyway
-        // (files may be locked; rename errors will surface in install) is
-        // worse than waiting, so keep retrying for 3 minutes.
-        ulog(&format!("waiting for pid {pid} (max 180s)"));
-        if let Err(e) = install::wait_process_exit(pid, std::time::Duration::from_secs(180)) {
-            ulog(&format!("wait failed: {e}"));
-            return 5;
+    // Primary wait: the launcher exe's image lock releases exactly when the
+    // process exits — probe the lock directly. If it stays locked (wedged
+    // launcher), force-kill the process tree so the update always proceeds;
+    // a graceful early exit simply skips the kill (probe passes at once).
+    match (&args.launch, args.wait_pid) {
+        (Some(exe), maybe_pid) => {
+            if install::probe_unlockable(exe) {
+                ulog("target already unlocked");
+            } else {
+                ulog(&format!("target locked: {}", exe.display()));
+                if let Some(pid) = maybe_pid {
+                    ulog(&format!("killing launcher pid {pid} tree"));
+                    if let Err(e) = install::kill_pid_tree(pid) {
+                        ulog(&format!("kill failed (continuing with wait): {e}"));
+                    }
+                }
+                if let Err(e) =
+                    install::wait_file_unlockable(exe, std::time::Duration::from_secs(30))
+                {
+                    ulog(&format!("wait failed: {e}"));
+                    return 5;
+                }
+                ulog("target unlocked");
+            }
         }
-        ulog("target exited");
+        (None, Some(pid)) => {
+            ulog(&format!("waiting for pid {pid} (max 180s)"));
+            if let Err(e) = install::wait_process_exit(pid, std::time::Duration::from_secs(180)) {
+                ulog(&format!("wait failed: {e}"));
+                return 5;
+            }
+            ulog("target exited");
+        }
+        _ => {}
     }
 
     let result = match args.strategy.as_str() {
