@@ -711,21 +711,45 @@ fn run_privileged(program: &str, script: &Path) -> PrivAttempt {
             format!("：{stderr}")
         }
     );
-    classify_priv_failure(program, code, &detail)
+    classify_priv_failure(program, code, &stderr, &detail)
 }
 
 /// 把退出码翻译成「用户拒绝授权」还是「该后端不可用」。
 ///
 /// 单独抽出来是为了在没有 root、没有 polkit agent 的环境里把这条判定测死：
 /// 它决定用户看到的是「你取消了授权，请手动升级」还是「这台机器提权不可用」，
-/// 也是退出码 6 与 4 的唯一分岔点。
-fn classify_priv_failure(program: &str, code: Option<i32>, detail: &str) -> PrivAttempt {
-    // pkexec 约定：127 = 用户关掉了授权弹窗；126 = 未获授权（无 agent / 策略拒绝）。
-    // 只有**明确取消**才不再往后端回退；126 之类要继续试 sudo -n。
-    if program == "pkexec" && code == Some(127) {
+/// 也是退出码 6 与 4 的唯一分岔点，并直接决定要不要继续往后端回退。
+fn classify_priv_failure(
+    program: &str,
+    code: Option<i32>,
+    stderr: &str,
+    detail: &str,
+) -> PrivAttempt {
+    // pkexec 约定：126 = 未获授权（无 agent / 策略拒绝）；127 通常是用户关掉弹窗。
+    //
+    // 但 127 **不只**表示取消：Debian 容器实测 polkitd 没在跑时 pkexec 同样退 127，
+    // stderr 是「Error getting authority: Error initializing authority: Could not
+    // connect」。那是后端不可用——若误判成"用户取消"就不再回退 sudo -n，于是配了
+    // 免密 sudoers 的机器永久无法自更新，与 #201 同属「误读信号」这一类缺陷。
+    if program == "pkexec" && code == Some(127) && !polkit_unreachable(stderr) {
         return PrivAttempt::Cancelled(detail.to_string());
     }
     PrivAttempt::Unavailable(detail.to_string())
+}
+
+/// polkit 自身起不来（守护进程缺失 / 连不上 / 非桌面会话）——绝不能算用户取消。
+fn polkit_unreachable(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    [
+        "error getting authority",
+        "error initializing authority",
+        "could not connect",
+        "cannot connect",
+        "no such file or directory",
+        "not authorized to perform operation",
+    ]
+    .iter()
+    .any(|needle| s.contains(needle))
 }
 
 /// 提权执行覆盖计划：`pkexec` → `sudo -n` 分级。
@@ -1087,37 +1111,61 @@ mod tests {
     // `zombie_from_stat_handles_bracketed_comm`；「已退出的 pid 必须立刻放行」见
     // `wait_for_target_uses_the_pid_not_the_write_probe_on_unix`。
 
-    /// 提权分类：用户取消（127）与后端不可用（126 / 缺二进制 / sudo 要密码）
-    /// 是两条不同的用户提示，也是退出码 6 与 4 的唯一分岔点。
+    /// 提权分类：「用户取消」与「后端不可用」是两条不同的用户提示，也是退出码
+    /// 6 与 4 的唯一分岔点，还决定要不要继续往后端回退。
     #[test]
     fn classify_separates_user_cancelled_from_backend_unavailable() {
         assert!(
             matches!(
-                classify_priv_failure("pkexec", Some(127), "d"),
+                classify_priv_failure(
+                    "pkexec",
+                    Some(127),
+                    "User cancelled authentication agent",
+                    "d"
+                ),
                 PrivAttempt::Cancelled(_)
             ),
             "用户关掉授权弹窗必须算取消，且不再回退别的后端"
         );
+        // Debian 容器实测：polkitd 没跑时 pkexec **也**退 127。那不是用户拒绝——
+        // 误判会挡掉 sudo -n 兜底，配了免密 sudoers 的机器于是永久无法自更新。
         assert!(
             matches!(
-                classify_priv_failure("pkexec", Some(126), "d"),
+                classify_priv_failure(
+                    "pkexec",
+                    Some(127),
+                    "Error getting authority: Error initializing authority: Could not connect: No such file or directory",
+                    "d"
+                ),
                 PrivAttempt::Unavailable(_)
             ),
-            "没有 polkit agent 不是用户拒绝，要继续试 sudo -n"
+            "polkit 连不上属于后端不可用，必须继续试 sudo -n"
         );
         assert!(
             matches!(
-                classify_priv_failure("sudo", Some(1), "sudo: a password is required"),
+                classify_priv_failure(
+                    "pkexec",
+                    Some(126),
+                    "Not authorized to perform operation",
+                    "d"
+                ),
+                PrivAttempt::Unavailable(_)
+            ),
+            "未获授权（无 agent / 策略拒绝）不是用户取消"
+        );
+        assert!(
+            matches!(
+                classify_priv_failure("sudo", Some(1), "sudo: a password is required", "d"),
                 PrivAttempt::Unavailable(_)
             ),
             "非交互 sudo 要密码属于不可用"
         );
         assert!(
             matches!(
-                classify_priv_failure("sudo", Some(127), "d"),
+                classify_priv_failure("sudo", Some(127), "unexpected", "d"),
                 PrivAttempt::Unavailable(_)
             ),
-            "只有 pkexec 的 127 才代表用户取消"
+            "只有 pkexec 的 127 才可能代表用户取消"
         );
     }
 
