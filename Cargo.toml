@@ -3,7 +3,7 @@ name = "qomicex-updater"
 version = "0.1.0"
 edition = "2021"
 description = "Qomicex Launcher self-updater: verify, install and relaunch"
-license = "GPL-3.0"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "qomicex-updater"

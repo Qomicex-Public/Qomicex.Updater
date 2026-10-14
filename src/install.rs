@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Install strategies: unzip the package into a staging directory next to the
 //! target, then move files into place. Elevation (pkexec / osascript) is only
 //! used when the target is not writable by the current user.

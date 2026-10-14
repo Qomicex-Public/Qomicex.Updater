@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! End-to-end self check: build a fake "old install" directory, pack a zip,
 //! sign it with minisign (if the binary is on PATH), run the updater CLI,
 //! assert the install dir was overwritten and the new launcher launched.
