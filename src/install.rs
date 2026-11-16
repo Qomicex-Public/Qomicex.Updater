@@ -733,12 +733,26 @@ pub fn render_overlay_script(ops: &[Op], staging: &Path, dst: &Path, cleanup_dst
 
     let mut body = String::from("#!/bin/sh\nset -e\n");
     if !tmps.is_empty() {
-        body.push_str("trap 'rm -f --");
+        // 只有本次渲染出来的临时名允许被清掉。
+        let mut rm = String::from("rm -f --");
         for tmp in &tmps {
-            body.push(' ');
-            body.push_str(&sh_quote(tmp));
+            rm.push(' ');
+            rm.push_str(&sh_quote(tmp));
         }
-        body.push_str("' EXIT INT TERM HUP\n");
+        // 失败/中断两条路径要分开写：
+        // - EXIT trap 覆盖 `set -e` 下的提前退出，执行完脚本照常退出，不必自己 exit。
+        // - 信号 trap 如果只清理不退出，sh 会在 handler 返回后**继续执行剩下的动作**
+        //   ——半截覆盖会接着往下写，比不清理更糟。所以必须显式 exit。
+        // `EXIT` 是 POSIX 方言里的 `0`，dash/bash/busybox sh 都认；用 `0` 反而与
+        // 信号名混在一起不好读，这里保留 EXIT 并同时给 0，兼容只认数字的实现。
+        body.push_str(&format!("{rm}\n"));
+        body.push_str(&format!(
+            "qmx_cleanup() {{ {rm}; }}\n\
+             trap 'qmx_cleanup' EXIT\n\
+             trap 'qmx_cleanup; exit 130' INT\n\
+             trap 'qmx_cleanup; exit 143' TERM\n\
+             trap 'qmx_cleanup; exit 129' HUP\n"
+        ));
     }
     for op in ops {
         match op {
@@ -777,9 +791,6 @@ pub fn render_overlay_script(ops: &[Op], staging: &Path, dst: &Path, cleanup_dst
     body.push_str("rm -rf -- ");
     body.push_str(&sh_quote(staging));
     body.push('\n');
-    // 正常收尾也必须拆掉 trap：它只该收拾中断留下的半截临时文件，
-    // 成功路径上的文件早被 mv 消耗掉了，留着只会多一次无用的 rm。
-    body.push_str("trap - EXIT INT TERM HUP\n");
     body
 }
 
@@ -1466,6 +1477,39 @@ mod tests {
             "已存在的目录（含内容）不能被这次创建动到"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 信号 trap 必须显式 exit（#204）。
+    ///
+    /// 这条只能在文本上钉死、不需要真发信号：POSIX 里信号 handler 返回后 sh 会
+    /// **继续执行剩下的动作**——提权脚本剩下的正是 `cp`/`mv`，等于中断之后接着
+    /// 半截覆盖。EXIT trap 则不必自己 exit（脚本本来就要退）。
+    #[test]
+    fn signal_traps_end_the_script_explicitly() {
+        let src = scratch("trap-shape-src");
+        let dst = scratch("trap-shape-dst");
+        std::fs::write(src.join("a"), b"a").unwrap();
+        let ops = plan_overlay(&src, &dst).unwrap();
+        let script = render_overlay_script(&ops, &src, &dst, false);
+
+        assert!(
+            script.contains("trap 'qmx_cleanup' EXIT"),
+            "EXIT trap 负责 set -e 提前退出时的清理：\n{script}"
+        );
+        for (sig, code) in [("INT", 130), ("TERM", 143), ("HUP", 129)] {
+            assert!(
+                script.contains(&format!("trap 'qmx_cleanup; exit {code}' {sig}")),
+                "信号 {sig} 的 handler 必须清理后显式 exit {code}，\
+                 否则 sh 会继续执行剩余的 cp/mv：\n{script}"
+            );
+        }
+        // 清理只允许碰本次渲染出来的临时名
+        assert!(
+            script.contains("qmx_cleanup() { rm -f --"),
+            "清理函数必须以 rm -f -- 开头且只带渲染出的路径：\n{script}"
+        );
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
     }
 
     /// 提权脚本以 root 执行，而包内文件名来自下载物——恶意/损坏的包不能把
