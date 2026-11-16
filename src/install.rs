@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Install strategies: unzip the package into a staging directory next to the
-//! target, then move files into place. Elevation (pkexec / osascript) is only
-//! used when the target is not writable by the current user.
+//! target, then move files into place. Elevation (osascript / pkexec / sudo) is
+//! only used when the target is not writable by the current user.
 
 use crate::ulog;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- waiting
@@ -392,25 +393,105 @@ fn first_file(dir: &Path) -> Option<PathBuf> {
 
 // ---------------------------------------------------------------- app strategy (macOS)
 
-pub fn install_app(package: &Path, app_bundle: Option<&Path>) -> Result<(), String> {
+pub fn install_app(package: &Path, app_bundle: Option<&Path>) -> Result<(), InstallFailure> {
     let bundle = app_bundle
-        .ok_or("--app-bundle is required for the app strategy")?
+        .ok_or_else(|| {
+            InstallFailure::from("--app-bundle is required for the app strategy".to_string())
+        })?
         .to_path_buf();
     if !bundle.is_dir() {
-        return Err(format!("app bundle {} not found", bundle.display()));
+        return Err(InstallFailure::from(format!(
+            "app bundle {} not found",
+            bundle.display()
+        )));
     }
     if dir_writable(&bundle) {
-        return install_dir(package, Some(&bundle));
+        return install_dir(package, Some(&bundle)).map_err(Into::into);
     }
-    // /Applications is admin-owned: stage locally, then elevate the copy.
-    let staging = std::env::temp_dir().join(format!("qomicex-update-app-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    extract_zip(package, &staging).map_err(|e| e.to_string())?;
-    elevate_copy(&staging, &bundle, true).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&staging);
-        e
-    })?;
+    // /Applications is admin-owned: stage privately, then elevate the copy.
+    let work = PrivateDir::create("app")?;
+    extract_zip(package, work.path()).map_err(|e| InstallFailure::from(e.to_string()))?;
+    // 取消语义必须原样传到 main.rs（exit 6 / ELEVATION_DENIED）：这里曾经
+    // 把 InstallFailure 压成 String，`denied` 一过手就丢了，用户取消被报成
+    // 「安装失败」(#204)。staging 由 PrivateDir 的 Drop 收拾，失败与取消都不例外。
+    elevate_copy(work.path(), &bundle, true)
+}
+
+/// 唯一、私有（0700）的一次性工作目录，Drop 时整棵删除。
+///
+/// 为什么不再用 `temp_dir().join("qomicex-update-app-<pid>")`：那个名字可预测。
+/// macOS 的提权脚本要落到这里再交给 `osascript`，root 会用「脚本自身」的身份去
+/// 执行它；预测得到路径就等于给了本地其它用户一个**预先放好同名文件/软链**
+/// 的机会（脚本被替换 → 以 root 执行）。所以名字里带纳秒时钟做熵，
+/// 且建目录失败（已存在）时只换名、绝不删别人的东西。
+struct PrivateDir {
+    path: PathBuf,
+}
+
+impl PrivateDir {
+    fn create(tag: &str) -> Result<Self, InstallFailure> {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::temp_dir();
+        for _ in 0..64 {
+            // 时钟纳秒 + 序号：单机并发与跨进程都不至于撞名；真正的保证仍是
+            // 「建不成就不复用」，熵只是让预置变得不现实。
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let name = format!(
+                "qomicex-update-{tag}-{}-{nanos:x}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = base.join(name);
+            match create_private_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                // 已存在（别的进程、或有人预先占位）→ 换名重试。
+                // 这里**不能**删除：那个路径不属于我们，删掉是别人目录的破坏面。
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(InstallFailure::from(format!(
+                        "cannot create {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        Err(InstallFailure::from(
+            "cannot create a private working directory in the temp dir".to_string(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// `mkdir` 语义上的排他建目录 + 0700。
+///
+/// 拆出来只为看清两件事：目录一定是**本次新建**的（AlreadyExists 交给调用方换名），
+/// 权限一定是 0700（`temp_dir` 默认是 1777，不提权时别人也能读）。
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir(path)?;
+    set_dir_mode_private(path)
+}
+
+#[cfg(unix)]
+fn set_dir_mode_private(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn set_dir_mode_private(_path: &Path) -> io::Result<()> {
+    // Windows 没有 DAC 权限位概念，也不走提权覆盖路径。
     Ok(())
 }
 
@@ -630,17 +711,47 @@ pub fn sh_quote(path: &Path) -> String {
 
 /// 渲染提权脚本：一条动作一行显式命令，不用 `find`、循环、变量展开或通配
 /// （除既有的 `*.qdtmp` 清理），整份脚本可以静态审阅。`staging` 由脚本最后删除。
+///
+/// 这个脚本是**以 root 身份**执行的，所以落位动作按「不跟随预置临时文件」写：
+///
+/// - `mkdir -p --`：前缀里的 `-` 不能变成选项；目标目录已存在时它必须是 no-op
+///   （`/Applications` 被误报成不可写时也能自愈，而不是整个更新死在第一条命令）。
+/// - `rm -f -- tmp` 后 `cp`：绝不写进一个已存在的同名对象。临时名可预测，预置
+///   软链就能让 root 把包内容写到任意路径上；先删再建等于只肯用自己新建的文件。
+/// - `trap` 只清本次渲染出来的那些临时名：中途失败不留半截 `.tmp`，也不用宽泛
+///   通配去删目标目录里的东西。
 pub fn render_overlay_script(ops: &[Op], staging: &Path, dst: &Path, cleanup_dst: bool) -> String {
+    // 本次可能出现的落位临时名：trap 只允许碰它们。
+    let mut tmps: Vec<PathBuf> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Place { to, .. } => Some(place_tmp(to)),
+            Op::MakeDir(_) => None,
+        })
+        .collect();
+    tmps.dedup();
+
     let mut body = String::from("#!/bin/sh\nset -e\n");
+    if !tmps.is_empty() {
+        body.push_str("trap 'rm -f --");
+        for tmp in &tmps {
+            body.push(' ');
+            body.push_str(&sh_quote(tmp));
+        }
+        body.push_str("' EXIT INT TERM HUP\n");
+    }
     for op in ops {
         match op {
             Op::MakeDir(dir) => {
-                body.push_str("mkdir -p ");
+                body.push_str("mkdir -p -- ");
                 body.push_str(&sh_quote(dir));
                 body.push('\n');
             }
             Op::Place { from, to, mode } => {
                 let tmp = place_tmp(to);
+                body.push_str("rm -f -- ");
+                body.push_str(&sh_quote(&tmp));
+                body.push('\n');
                 body.push_str("cp -f -- ");
                 body.push_str(&sh_quote(from));
                 body.push(' ');
@@ -661,23 +772,79 @@ pub fn render_overlay_script(ops: &[Op], staging: &Path, dst: &Path, cleanup_dst
     }
     if cleanup_dst {
         // macOS .app：清掉下载器可能留下的半截 .qdtmp 临时包（既有行为）。
-        body.push_str(&format!("rm -f {}/*.qdtmp\n", sh_quote(dst)));
+        body.push_str(&format!("rm -f -- {}/*.qdtmp\n", sh_quote(dst)));
     }
     body.push_str("rm -rf -- ");
     body.push_str(&sh_quote(staging));
     body.push('\n');
+    // 正常收尾也必须拆掉 trap：它只该收拾中断留下的半截临时文件，
+    // 成功路径上的文件早被 mv 消耗掉了，留着只会多一次无用的 rm。
+    body.push_str("trap - EXIT INT TERM HUP\n");
     body
 }
 
 /// 提权后端的一次尝试结果。
 enum PrivAttempt {
     Done,
-    /// 用户明确取消授权（关掉 polkit 弹窗）——**不再**尝试别的提权后端：
-    /// 这是选择而不是故障，绕开它等于无视用户的拒绝。
+    /// 用户明确取消授权（关掉 polkit 弹窗 / macOS 点「取消」）——**不再**尝试
+    /// 别的提权后端：这是选择而不是故障，绕开它等于无视用户的拒绝。
     Cancelled(String),
+    /// 提权已经拿到，是覆盖脚本自己失败了。同样不能再试下一个后端：重放同一条
+    /// 必然失败的计划，只会用 `sudo: a password is required` 之类的次生错误盖掉
+    /// 真正的现场。映射为 `UPDATE_INSTALL_FAILED`（exit 4）。
+    ExecFailed(String),
     /// 该后端不可用（缺二进制 / 无 polkit agent / 非交互 sudo 要密码）
     /// → 继续试下一个后端。
     Unavailable(String),
+}
+
+/// macOS 上图形授权弹窗的固定 AppleScript。
+///
+/// 为什么用 `on run argv` 而不是把路径拼进脚本源码：AppleScript 字符串转义与
+/// Shell 引用是两个独立边界，拼源码就要同时转义两层（`\`、`"` 与 `'`），任何一层
+/// 漏掉都会在提权上下文里变成命令注入。这里脚本源码是常量，路径只作为进程参数
+/// 进来，再由 `quoted form of` 转成单层 shell 引用。
+///
+/// 为什么在脚本里区分错误号：`do shell script` 在 shell 非零退出时抛出**退出码
+/// 同号**的 AppleScript 错误（TN2065），而用户点「取消」抛的是 -128。若直接把
+/// 进程退出码当成判据，一个恰好退 42 的脚本会与「取消」混淆（-128 亦然）。
+/// 因此这里把两种失败翻译成 stdout 上的机器标记。
+///
+/// 为什么把 `do shell script` 的结果赋给变量而不是直接返回：它会连安装脚本的
+/// stdout 一起回吐，混进标记就会让「标记」失去唯一性（脚本打印一个同名串即可
+/// 伪造成功）。赋给变量即丢弃，stdout 只剩标记本身。
+const OSASCRIPT_ELEVATE: &str = "on run argv
+	set scriptPath to item 1 of argv
+	try
+		set installOutput to do shell script \"/bin/sh \" & quoted form of scriptPath with administrator privileges
+	on error errMsg number errNum
+		if errNum is -128 then
+			return \"QOMICEX_CANCELLED\"
+		end if
+		return \"QOMICEX_FAILED\"
+	end try
+	return \"QOMICEX_OK\"
+end run";
+
+/// 提权后端顺序。
+///
+/// 抽成「按 os 名取表」而不是直接用 `cfg!`：这条顺序是本 issue 的核心契约
+/// （先弹授权、失败才退让），必须能在任意平台上被测死，而不是只有 mac 机器
+/// 才跑得到一半。
+fn backends_for(os: &str) -> &'static [&'static str] {
+    // macOS 只能走图形授权：GUI 进程没有 tty，`sudo` 永远等不到密码；`pkexec`
+    // 在 macOS 上根本不存在。`sudo -n` 仅作为 osascript **无法启动**时的兜底
+    // （配了免密 sudoers 的机器），一旦 osascript 真的跑起来就不再退让——取消、
+    // 授权失败、脚本失败都必须立刻停止，绕开用户的拒绝等于无视它。
+    if os == "macos" {
+        return &["osascript", "sudo"];
+    }
+    // Linux / 其它 unix：既有语义不变（#201 的修复就是在这条链上）。
+    &["pkexec", "sudo"]
+}
+
+fn privilege_backends() -> &'static [&'static str] {
+    backends_for(std::env::consts::OS)
 }
 
 /// `program` 以 root 身份跑 `sh <script>`。
@@ -686,6 +853,9 @@ enum PrivAttempt {
 /// 「elevated copy failed (pkexec exit 1)」这种既定位不了也没法转成
 /// 可操作提示的日志（#201 取证的主要困难）。
 fn run_privileged(program: &str, script: &Path) -> PrivAttempt {
+    if program == "osascript" {
+        return run_osascript(script);
+    }
     let mut cmd = Command::new(program);
     // -n = 绝不弹密码提示：自更新是无人值守链路，卡在读 stdin 上会让
     // 启动器进程与 updater 一起挂死。
@@ -717,11 +887,72 @@ fn run_privileged(program: &str, script: &Path) -> PrivAttempt {
     classify_priv_failure(program, code, &stderr, &detail)
 }
 
+/// macOS 图形授权：`osascript` 跑固定脚本，提权脚本路径经 argv 传入。
+///
+/// 退出码在这里**不**是判据（`do shell script` 抛出的 AppleScript 错误也不改
+/// osascript 的退出码，成功/失败都可能是 0），唯一判据是 stdout 上的机器标记。
+fn run_osascript(script: &Path) -> PrivAttempt {
+    let out = match Command::new("osascript")
+        .arg("-e")
+        .arg(OSASCRIPT_ELEVATE)
+        .arg(script)
+        .output()
+    {
+        Ok(o) => o,
+        // spawn 失败（osascript 不在预期位置 / 无图形会话）：判「不可用」，
+        // 允许后续 sudo -n 兜底。这是唯一允许回退的情形——此时提权脚本
+        // 一次都还没被执行过。
+        Err(e) => return PrivAttempt::Unavailable(format!("osascript 无法执行: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let detail = format!(
+        "osascript {}{}",
+        match out.status.code() {
+            Some(c) => format!("退出 {c}"),
+            None => "被信号终止".into(),
+        },
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("：{stderr}")
+        }
+    );
+    classify_osascript(&stdout, &detail)
+}
+
+/// osascript 的标准输出 → 提权结论。
+///
+/// AppleScript 把 `do shell script` 的结果丢进局部变量后只返回标记，所以正常
+/// 情况下 stdout 恰好是标记本身；仍按**整份输出**比对，任何多余内容（警告、
+/// 其它程序写入）都按失败处理，绝不当成成功。
+fn classify_osascript(stdout: &str, detail: &str) -> PrivAttempt {
+    match stdout.trim() {
+        "QOMICEX_OK" => PrivAttempt::Done,
+        // -128 = 用户在授权弹窗上点了取消。这是**选择**而不是故障：不再试别的
+        // 后端，直接映射为「提权未获授权」（exit 6 / ELEVATION_DENIED）。
+        "QOMICEX_CANCELLED" => PrivAttempt::Cancelled(format!("{detail}（用户取消授权）")),
+        // 授权已经通过，是安装脚本自己失败（shell 非零退出）——不能再退给
+        // `sudo -n`：那条路必然报 "a password is required"，用一个无关的失败
+        // 盖掉真正的现场（当时是哪个文件、哪个 mkdir 出的事），也白重放一次。
+        "QOMICEX_FAILED" => {
+            PrivAttempt::ExecFailed(format!("{detail}（已获授权，安装脚本执行失败）"))
+        }
+        // 标记以外的任何输出：协议没走通，同样不能当成功，也不该再提权重放。
+        _ => PrivAttempt::ExecFailed(format!("{detail}（授权流程返回了无法识别的结果）")),
+    }
+}
+
 /// 把退出码翻译成「用户拒绝授权」还是「该后端不可用」。
 ///
 /// 单独抽出来是为了在没有 root、没有 polkit agent 的环境里把这条判定测死：
 /// 它决定用户看到的是「你取消了授权，请手动升级」还是「这台机器提权不可用」，
 /// 也是退出码 6 与 4 的唯一分岔点，并直接决定要不要继续往后端回退。
+///
+/// 只有「明确没得到授权」才允许算取消。pkexec 拿到授权后只剩一种结果：
+/// 脚本以 uid 0 跑完（我们看到的成功）或脚本自己失败——而**后者**在这个函数
+/// 眼里和后端不可用无从区分（都是非零退出），所以归 `Unavailable`：把它们分开
+/// 需要 `pkexec` 的自定义错误码或 polkit 的 agent 事件，不在本 issue 范围。
 fn classify_priv_failure(
     program: &str,
     code: Option<i32>,
@@ -755,7 +986,10 @@ fn polkit_unreachable(stderr: &str) -> bool {
     .any(|needle| s.contains(needle))
 }
 
-/// 提权执行覆盖计划：`pkexec` → `sudo -n` 分级。
+/// 提权执行覆盖计划：按平台分级。
+///
+/// - macOS：`osascript`（管理员授权弹窗）→ `sudo -n`（仅 spawn 失败时兜底）
+/// - Linux / 其它 unix：`pkexec`（polkit 弹窗）→ `sudo -n`（免密 sudoers）
 ///
 /// 为什么要留 sudo -n：不是每台机器都跑 polkit agent（无桌面/minimal 安装/
 /// 定制发行版），而配了免密 sudoers 的机器不该因此永久无法自更新。
@@ -766,23 +1000,29 @@ fn elevate_overlay(
     dst: &Path,
     cleanup_dst: bool,
 ) -> Result<(), InstallFailure> {
-    let script_path =
-        std::env::temp_dir().join(format!("qomicex-update-elevate-{}.sh", std::process::id()));
+    // 脚本放在私有目录里并 0700：它会以 root 身份被 osascript/pkexec/sudo 执行，
+    // 可预测的共享路径等于把「先放一个同名文件」的机会留给本地其它用户。
+    let work = PrivateDir::create("elevate")?;
+    let script_path = work.path().join("overlay.sh");
     let body = render_overlay_script(ops, staging, dst, cleanup_dst);
-    std::fs::write(&script_path, &body)
-        .map_err(|e| InstallFailure::from(format!("cannot write elevate script: {e}")))?;
+    write_private_script(&script_path, &body)?;
 
     let mut cancelled: Option<String> = None;
+    let mut exec_failed: Option<String> = None;
     let mut unavailable: Vec<String> = Vec::new();
-    for program in ["pkexec", "sudo"] {
+    for program in privilege_backends() {
         match run_privileged(program, &script_path) {
             PrivAttempt::Done => {
-                let _ = std::fs::remove_file(&script_path);
                 return Ok(());
             }
             PrivAttempt::Cancelled(reason) => {
                 ulog(&format!("{program} 授权被取消: {reason}"));
                 cancelled = Some(reason);
+                break;
+            }
+            PrivAttempt::ExecFailed(reason) => {
+                ulog(&format!("{program} 已获授权但覆盖失败: {reason}"));
+                exec_failed = Some(reason);
                 break;
             }
             PrivAttempt::Unavailable(reason) => {
@@ -798,24 +1038,67 @@ fn elevate_overlay(
         dst.display(),
         body
     ));
-    Err(match cancelled {
-        Some(reason) => InstallFailure {
+    Err(match (cancelled, exec_failed) {
+        (Some(reason), _) => InstallFailure {
             denied: true,
-            message: format!(
-                "提权未获授权（{reason}）。手动升级：sudo dpkg -i <deb> 或 sudo rpm -Uvh <rpm>"
-            ),
+            message: format!("提权未获授权（{reason}）。{}", manual_upgrade_hint()),
         },
-        None => InstallFailure {
+        // 授权是给了的：换手动升级的建议没有意义，用户需要的是真正的现场。
+        (None, Some(reason)) => InstallFailure {
+            denied: false,
+            message: format!("提权成功但覆盖未完成：{reason}"),
+        },
+        (None, None) => InstallFailure {
             denied: false,
             message: format!("提权失败：{}", unavailable.join("；")),
         },
     })
 }
 
+/// 把提权脚本写进私有目录：排他创建 + 0700。
+///
+/// 不用 `std::fs::write`：它会跟随已存在的同名对象（软链 → 写到别处，或写进别人
+/// 预先建好的文件）。`create_new` 保证写的一定是自己新建的 inode；权限位在打开
+/// 时给，不留「先可读、后 chmod」的窗口。
+fn write_private_script(path: &Path, body: &str) -> Result<(), InstallFailure> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o700);
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| InstallFailure::from(format!("cannot write elevate script: {e}")))?;
+    file.write_all(body.as_bytes())
+        .map_err(|e| InstallFailure::from(format!("cannot write elevate script: {e}")))?;
+    Ok(())
+}
+
+/// 「用户自己重装一次」的手动出路。
+///
+/// 按平台分派：Debian/RPM 的建议在 macOS 上毫无意义，而这段文案会一路进
+/// `last-update-error.json` 并弹在用户面前（#201 要的正是可操作的提示）。
+fn manual_upgrade_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "手动升级：重新下载 DMG 并把 Qomicex Launcher 拖入「应用程序」覆盖旧版本"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "手动升级：sudo dpkg -i <deb> 或 sudo rpm -Uvh <rpm>"
+    }
+}
+
 /// macOS .app 覆盖的提权入口（保留旧签名，install_app 不感知计划渲染）。
-fn elevate_copy(src: &Path, dst: &Path, cleanup_dst: bool) -> Result<(), String> {
-    let ops = plan_overlay(src, dst).map_err(|e| e.to_string())?;
-    elevate_overlay(&ops, src, dst, cleanup_dst).map_err(|f| f.message)
+///
+/// 返回 `InstallFailure` 而不是 `String`：`denied` 是 exit 6 与 exit 4 的唯一
+/// 分岔点，压成字符串就等于把「用户取消」报成「安装失败」(#204)。
+fn elevate_copy(src: &Path, dst: &Path, cleanup_dst: bool) -> Result<(), InstallFailure> {
+    let ops = plan_overlay(src, dst).map_err(|e| InstallFailure::from(e.to_string()))?;
+    elevate_overlay(&ops, src, dst, cleanup_dst)
 }
 
 fn dir_writable(dir: &Path) -> bool {
@@ -980,6 +1263,209 @@ mod tests {
         // 脚本自己负责删 staging（旧实现同样依赖这条，不能因为改用 mv 就丢掉）
         assert!(!src.exists(), "脚本末尾应清理 staging：\n{script}");
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 目标同目录里**预先放好**的落位临时名不能被复用（#204）。
+    ///
+    /// 临时名 (`.<name>.qomicex-update-tmp`) 是可预测的：预置一个软链，root 的
+    /// `cp` 就会顺着它把包内容写到任意路径上。脚本必须先删再建，只肯写自己新建
+    /// 的文件。这里用「指向目录的软链」证明那一刻它确实被删掉了——不删则 `cp`
+    /// 失败、脚本非零退出。
+    #[cfg(unix)]
+    #[test]
+    fn overlay_script_never_reuses_a_preset_placement_tmp() {
+        let src = scratch("preset-src");
+        let dst = scratch("preset-dst");
+        std::fs::create_dir_all(dst.join("usr/bin")).unwrap();
+        std::fs::write(src.join("payload"), b"payload").unwrap();
+
+        let ops = plan_overlay(&src, &dst).unwrap();
+        let to = dst.join("payload");
+        let tmp = place_tmp(&to);
+        // 软链指向目录：`cp` 若跟随它就会失败（也是「没被删掉」的证据）。
+        let decoy = dst.join("decoy-dir");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::os::unix::fs::symlink(&decoy, &tmp).unwrap();
+
+        let script = render_overlay_script(&ops, &src, &dst, false);
+        let script_path = dst.join("run.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let status = Command::new("sh").arg(&script_path).status().unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "预置的落位临时名被复用了（软链应当先被删掉）：\n{script}"
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        assert!(
+            std::fs::symlink_metadata(&tmp).is_err(),
+            "落位临时名应在 mv 之后消失：\n{script}"
+        );
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 脚本中途失败时只能留下「自己刚建的那些临时名」，且必须被 trap 清掉（#204）。
+    ///
+    /// 构造法：第二个 Place 的源文件在渲染后删掉 → `cp` 失败 → `set -e` 退出。
+    /// 此时第一个 Place 的临时文件已经建好，正是 trap 该收拾的东西；目标是
+    /// 预置的旧内容，不能被半截覆盖。
+    #[cfg(unix)]
+    #[test]
+    fn overlay_script_cleans_its_own_tmps_when_it_fails_midway() {
+        let src = scratch("trap-src");
+        let dst = scratch("trap-dst");
+        std::fs::write(src.join("a-first"), b"new-a").unwrap();
+        std::fs::write(src.join("b-second"), b"new-b").unwrap();
+        std::fs::write(dst.join("a-first"), b"old-a").unwrap();
+        std::fs::write(dst.join("b-second"), b"old-b").unwrap();
+
+        let ops = plan_overlay(&src, &dst).unwrap();
+        let script = render_overlay_script(&ops, &src, &dst, false);
+        let script_path = dst.join("run.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        // 渲染完成后再让第二个源消失，脚本跑到那一步就失败。
+        std::fs::remove_file(src.join("b-second")).unwrap();
+
+        let status = Command::new("sh").arg(&script_path).status().unwrap();
+        assert!(!status.success(), "源缺失时脚本必须失败：\n{script}");
+
+        for name in ["a-first", "b-second"] {
+            let target = dst.join(name);
+            assert!(
+                std::fs::symlink_metadata(place_tmp(&target)).is_err(),
+                "失败路径上 {name} 的临时文件没被清掉：\n{script}"
+            );
+            assert!(
+                std::fs::read(&target).unwrap().starts_with(b"old-"),
+                "{name} 被半截覆盖了：\n{script}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 目标目录已存在时 `mkdir -p` 必须是 no-op（#204 的 macOS 场景）。
+    ///
+    /// `/Applications` 由系统预建：真去建它就得到 EEXIST，`set -e` 下整条提权
+    /// 脚本会死在第一条命令上。这条同时钉住「-p 别丢」。
+    #[cfg(unix)]
+    #[test]
+    fn overlay_script_tolerates_a_pre_existing_target_dir() {
+        let src = scratch("mkdir-src");
+        let dst = scratch("mkdir-dst");
+        std::fs::create_dir_all(src.join("Frameworks")).unwrap();
+        std::fs::write(src.join("Frameworks/lib.dylib"), b"lib").unwrap();
+        // 目标目录先建好（模拟 /Applications 形态）
+        std::fs::create_dir_all(dst.join("Frameworks")).unwrap();
+
+        let ops = plan_overlay(&src, &dst).unwrap();
+        assert!(
+            ops.contains(&Op::MakeDir(dst.join("Frameworks"))),
+            "计划里本来就该有这条：{:?}",
+            ops
+        );
+        let script = render_overlay_script(&ops, &src, &dst, false);
+        let script_path = dst.join("run.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let status = Command::new("sh").arg(&script_path).status().unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "已存在的目标目录把整个脚本弄挂了：\n{script}"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("Frameworks/lib.dylib")).unwrap(),
+            b"lib"
+        );
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 提权链路的一次性工作目录：唯一、私有、用完即清（#204）。
+    ///
+    /// 这些正是 macOS 提权脚本的落脚点。三条都必须成立，缺一条就是本地提权面：
+    /// 目录名可预测 → 别人能预置；权限不是 0700 → 别人能读改；不清理 → 残留可被
+    /// 下次执行利用。
+    #[cfg(unix)]
+    #[test]
+    fn private_work_dir_is_unique_private_and_self_cleaning() {
+        let first = PrivateDir::create("unit").unwrap();
+        let second = PrivateDir::create("unit").unwrap();
+        assert_ne!(
+            first.path(),
+            second.path(),
+            "两次创建必须拿到不同目录，不能复用固定名"
+        );
+        assert_eq!(
+            mode_of(first.path()) & 0o777,
+            0o700,
+            "提权脚本的落脚目录必须只有自己可读写"
+        );
+        // 排他创建：预先占位同名目录时不能直接拿来用（换个名字重试）。
+        assert!(first.path().is_dir());
+        let path = first.path().to_path_buf();
+        drop(first);
+        drop(second);
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "PrivateDir 的 Drop 必须整棵删掉：{}",
+            path.display()
+        );
+    }
+
+    /// 提权脚本文件本身：排他创建 + 0700，且不跟随预置同名对象（#204）。
+    #[cfg(unix)]
+    #[test]
+    fn elevate_script_is_written_exclusively_and_not_world_readable() {
+        let dir = scratch("priv-script");
+        let path = dir.join("overlay.sh");
+        write_private_script(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(
+            mode_of(&path) & 0o777,
+            0o700,
+            "以 root 执行的脚本不能给别人读改"
+        );
+        // 已存在就必须失败，而不是覆盖/跟随（软链是这里的攻击面）
+        let err = write_private_script(&path, "#!/bin/sh\nexit 1\n");
+        assert!(
+            err.is_err(),
+            "已存在的脚本必须拒绝覆盖（否则预置软链可让 root 写到任意路径）"
+        );
+        let target = dir.join("outside");
+        let link = dir.join("link.sh");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_private_script(&link, "x").is_err(), "软链不能被跟随");
+        assert!(!target.exists(), "内容不该被写到软链指向处");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目标路径已被别人占用时：换名重试，**绝不**删掉那个已存在的目录（#204）。
+    ///
+    /// 这里直接把 `create_private_dir` 的 AlreadyExists 分支单拎出来测：它是
+    /// 「多用户机器上不越界」这条的分水岭，删别人的目录比不复用更糟。
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_creation_never_disturbs_an_existing_path() {
+        let base = scratch("collide");
+        let taken = base.join("taken");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("someone-elses-file"), b"keep me").unwrap();
+
+        let err = create_private_dir(&taken).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists,
+            "必须把「已存在」如实报给调用方，而不是吞掉或覆盖"
+        );
+        assert_eq!(
+            std::fs::read(taken.join("someone-elses-file")).unwrap(),
+            b"keep me",
+            "已存在的目录（含内容）不能被这次创建动到"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 提权脚本以 root 执行，而包内文件名来自下载物——恶意/损坏的包不能把
@@ -1172,6 +1658,124 @@ mod tests {
         );
     }
 
+    /// issue #204：macOS 的管理员授权弹窗取消必须走 `Cancelled`（→ exit 6 /
+    /// `ELEVATION_DENIED`），而**不能**靠退出码判断。
+    ///
+    /// `do shell script` 抛出的 AppleScript 错误号就是 shell 的退出码（TN2065），
+    /// 用户取消是 -128；两者混在一个数字空间里。所以判定只看 stdout 标记。
+    #[test]
+    fn osascript_marker_separates_cancel_from_install_failure() {
+        assert!(
+            matches!(classify_osascript("QOMICEX_OK\n", "d"), PrivAttempt::Done),
+            "标记为 OK 才允许算安装成功"
+        );
+        assert!(
+            matches!(
+                classify_osascript("QOMICEX_CANCELLED", "d"),
+                PrivAttempt::Cancelled(_)
+            ),
+            "用户点取消必须映射为「授权被取消」，否则会被报成安装失败"
+        );
+        assert!(
+            matches!(
+                classify_osascript("QOMICEX_FAILED", "d"),
+                PrivAttempt::ExecFailed(_)
+            ),
+            "已获授权但脚本失败，不能回退给 sudo -n 重放（会盖掉真正的失败原因）"
+        );
+        // 协议没走通（空输出 / 夹杂别的输出）：既不是成功也不是取消，
+        // 同样不该再提权重放一次。
+        for marker in ["", "some shell output", "exit 128"] {
+            assert!(
+                matches!(classify_osascript(marker, "d"), PrivAttempt::ExecFailed(_)),
+                "非标记输出 {marker:?} 必须按失败处理，绝不能当成功"
+            );
+        }
+        // 安装脚本的 stdout 会一起回吐：标记藏在别的输出里不算数（否则一个打印
+        // 了字面量的脚本就能伪造成功）。
+        assert!(
+            matches!(
+                classify_osascript("cp done\nQOMICEX_OK", "d"),
+                PrivAttempt::ExecFailed(_)
+            ),
+            "标记只在整份输出恰好等于标记时采信"
+        );
+    }
+
+    /// 后端顺序就是「先弹授权、失败才退让」的契约本身（#204）。
+    ///
+    /// 顺序错了会直接复现缺陷：macOS 上先试 `pkexec`/`sudo -n` 只会白失败一次，
+    /// 配了免密 sudoers 的机器甚至绕过授权弹窗。所以两个平台的分支都要在同一台
+    /// 机器上可测——只断言 `cfg!` 命中的那一支等于放跑另一支。
+    #[test]
+    fn privilege_backends_are_ordered_per_platform() {
+        assert_eq!(
+            backends_for("macos"),
+            &["osascript", "sudo"],
+            "macOS 必须先弹管理员授权；pkexec 在 macOS 上不存在，试它是白费"
+        );
+        assert_eq!(
+            backends_for("linux"),
+            &["pkexec", "sudo"],
+            "Linux 的既有语义（#201）不能被本次改动打乱"
+        );
+        assert_eq!(
+            backends_for("freebsd"),
+            &["pkexec", "sudo"],
+            "其它 unix 与 Linux 同构，不需要单独的图形授权分支"
+        );
+        // 生产入口必须选中本平台那一支
+        assert_eq!(privilege_backends(), backends_for(std::env::consts::OS));
+    }
+
+    /// AppleScript 源码的几条不变量（脚本是常量，可在任意平台静态钉住）。
+    ///
+    /// 这些点错了不会在本仓库的 CI（无 macOS）里暴露，只会在用户机器上表现为
+    /// 「每次都提示授权被取消」或「路径带引号就注入」——所以只能靠断言守。
+    #[test]
+    fn osascript_script_keeps_its_safety_invariants() {
+        let src = OSASCRIPT_ELEVATE;
+        assert!(
+            src.contains("on run argv") && src.contains("item 1 of argv"),
+            "脚本路径必须从 argv 进来，而不是被拼进 AppleScript 源码"
+        );
+        assert!(
+            src.contains("quoted form of scriptPath"),
+            "路径进 shell 前必须经 quoted form of 转义"
+        );
+        assert!(
+            src.contains("with administrator privileges"),
+            "缺了这段就不是管理员授权弹窗，GUI 进程根本提不了权"
+        );
+        assert!(
+            src.contains("errNum is -128"),
+            "-128 是用户在授权弹窗点取消的错误号，误判会把它报成安装失败"
+        );
+        // 标记必须是脚本自己产出的，且不能把安装输出漏进 stdout
+        assert!(
+            src.contains("set installOutput to do shell script"),
+            "do shell script 的返回值必须被丢弃，否则安装脚本的 stdout 会混进标记"
+        );
+        // 双引号是 AppleScript 字符串的边界：源码里除配对的外不能出现裸引号
+        assert_eq!(
+            src.matches('"').count() % 2,
+            0,
+            "AppleScript 字符串引号必须成对：{src}"
+        );
+    }
+
+    /// 取消语义必须能穿过 `install_app` 的提权分支（#204 的直接回归）。
+    ///
+    /// 真去 spawn osascript/pkexec 会弹授权窗，测试里不能那么干；但缺陷的实质是
+    /// **类型**：`elevate_copy` 曾把 `InstallFailure` 压成 `String` 再往上返回，
+    /// `denied` 一过手就没了。编译期钉住这个签名，比运行时断言更早拦住回归。
+    #[cfg(unix)]
+    #[test]
+    fn elevate_copy_preserves_the_denied_flag() {
+        let _typed: fn(&Path, &Path, bool) -> Result<(), InstallFailure> = elevate_copy;
+        let _typed_app: fn(&Path, Option<&Path>) -> Result<(), InstallFailure> = install_app;
+    }
+
     /// 后端二进制根本不存在（无 polkit 的定制发行版、macOS）必须判「不可用」，
     /// 绝不能卡在交互提示上——自更新是无人值守链路。
     #[test]
@@ -1188,6 +1792,7 @@ mod tests {
             }
             PrivAttempt::Done => panic!("不存在的后端不该报成功"),
             PrivAttempt::Cancelled(_) => panic!("缺二进制不等于用户取消"),
+            PrivAttempt::ExecFailed(_) => panic!("脚本根本没跑起来，谈不上执行失败"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

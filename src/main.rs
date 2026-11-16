@@ -179,9 +179,7 @@ fn run() -> i32 {
         "appimage" => {
             install::install_appimage(&args.package, args.appimage.as_deref()).map_err(Into::into)
         }
-        "app" => {
-            install::install_app(&args.package, args.app_bundle.as_deref()).map_err(Into::into)
-        }
+        "app" => install::install_app(&args.package, args.app_bundle.as_deref()),
         "system" => install::install_system(&args.package, args.launch.as_deref()),
         other => Err(install::InstallFailure::from(format!(
             "unknown strategy: {other}"
